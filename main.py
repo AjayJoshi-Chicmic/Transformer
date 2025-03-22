@@ -1,27 +1,20 @@
-import requests
 import torch
 import torch.nn as nn
 from torch.nn import functional as f
-import math
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cpu' if torch.cuda.is_available() else 'cpu'
+batch_size = 64
+block_size = 256
 eval_iters = 200
-eval_interval = 300
-max_iters =3000
-learning_rate = 1e-2
+eval_interval = 500
+max_iters =5000
+learning_rate = 3e-4
+n_embd = 384
+n_layer =6
+n_head =6
+dropout = 0.2
 
 torch.manual_seed(21434)
-
-
-url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-response = requests.get(url)
-
-if response.status_code == 200:
-    with open("input.txt", "wb") as file:
-        file.write(response.content)
-    print("Download complete!")
-else:
-    print("Failed to download file, status code:", response.status_code)
 
 
 with open('input.txt','r',encoding='utf-8') as F:
@@ -44,7 +37,7 @@ data = torch.tensor(encode(text),dtype=torch.long)
 n= int(0.9*len(data))
 train_data = data[:n]
 val_data = data[n:]
-block_size = 8
+
 
 x = train_data[:block_size]
 y = train_data[1:block_size+1]
@@ -53,9 +46,6 @@ for t in range(block_size):
     target = y[t]
     print(f"target = {target} context = {context}")
 
-
-batch_size = 4
-block_size = 8
 def get_batch(split):
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data)-block_size,(batch_size,))
@@ -81,14 +71,94 @@ def estimate_loss():
     model.train()
     return out
 
+class FeedForward(nn.Module):
+    def __init__(self,n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd,4* n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd,n_embd),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+    
+class Block(nn.Module):
+
+    def __init__(self, n_embd,n_head) -> None:
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa =MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias = False)
+        self.query = nn.Linear (n_embd, head_size, bias = False)
+        self.value = nn.Linear (n_embd, head_size, bias = False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size,block_size)))
+
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self,x):
+        B,T,C = x.shape
+        k = self.key(x)
+        q = self.query(x)
+        
+        wei = q @ k.transpose(-2,-1) * C**-0.5
+
+        wei = wei.masked_fill(self.tril[:T,:T]==0, float('-inf'))
+        wei = f.softmax(wei, dim=-1)
+
+        wei = self.dropout(wei)
+        
+        v = self.value(x)
+        out = wei @ v
+        return out
+    
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(num_heads*head_size, n_embd)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
+        
 
 class BigramLanguageModel(nn.Module):
-    def __init__(self,vocab_size):
+    def __init__(self):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size,vocab_size)
+        self.token_embedding_table = nn.Embedding(vocab_size,n_embd)
+        self.position_embedding_table = nn.Embedding(block_size,n_embd)
+        self.blocks = nn.Sequential( *[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd,vocab_size)
+
 
     def forward(self, idx, target=None):
-        logits = self.token_embedding_table(idx)
+        B,T = idx.shape
+        tok_emb = self.token_embedding_table(idx)
+        pos_embd = self.position_embedding_table(torch.arange(T,device = device))
+        x = tok_emb +pos_embd
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        #x = self.sa_heads(x)
+        logits = self.lm_head(x)
 
         if target is None:
             loss = None
@@ -101,7 +171,8 @@ class BigramLanguageModel(nn.Module):
 
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
-            logits, loss = self(idx)
+            idx_cond = idx[:, -block_size:]
+            logits, loss = self(idx_cond)
             logits = logits[:, -1, :]
             probs = f.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
@@ -109,14 +180,13 @@ class BigramLanguageModel(nn.Module):
         return idx 
 
 
-model = BigramLanguageModel(vocab_size)
-m =model.to(device)
+model = BigramLanguageModel()
+m = model.to(device)
+xb = xb.to(device)
+yb = yb.to(device)
 logits , loss = m.forward(xb,yb)
 
 print(logits.shape)
-print(loss)
- 
-print(decode(m.generate(idx = torch.zeros((1,1), dtype = torch.long),max_new_tokens=100)[0].tolist()))
 
 optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
 
